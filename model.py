@@ -449,14 +449,19 @@ class Generator(nn.Module):
 
         self.n_latent = self.log_size * 2 - 2
 
-    def make_noise(self):
+    def make_noise(self, zero=False):
         device = self.input.input.device
-
-        noises = [torch.randn(1, 1, 2 ** 2, 2 ** 2, device=device)]
+        if zero:
+            noises = [torch.zeros([1, 1, 2 ** 2, 2 ** 2], device=device)]
+        else:
+            noises = [torch.randn(1, 1, 2 ** 2, 2 ** 2, device=device)]
 
         for i in range(3, self.log_size + 1):
             for _ in range(2):
-                noises.append(torch.randn(1, 1, 2 ** i, 2 ** i, device=device))
+                if zero:
+                    noises.append(torch.zeros([1, 1, 2 ** i, 2 ** i], device=device))
+                else:
+                    noises.append(torch.randn(1, 1, 2 ** i, 2 ** i, device=device))
 
         return noises
 

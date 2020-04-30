@@ -73,10 +73,10 @@ def make_image(tensor):
 
 
 if __name__ == '__main__':
-    device = 'cuda'
-
     parser = argparse.ArgumentParser()
+    parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--ckpt', type=str, required=True)
+    parser.add_argument('--path', type=str, default='.')
     parser.add_argument('--size', type=int, default=256)
     parser.add_argument('--lr_rampup', type=float, default=0.05)
     parser.add_argument('--lr_rampdown', type=float, default=0.25)
@@ -87,9 +87,13 @@ if __name__ == '__main__':
     parser.add_argument('--noise_regularize', type=float, default=1e5)
     parser.add_argument('--mse', type=float, default=0)
     parser.add_argument('--w_plus', action='store_true')
+    parser.add_argument('--disable_noise', action='store_true')
+    parser.add_argument('--init_noise_zeros', action='store_true')
     parser.add_argument('files', metavar='FILES', nargs='+')
 
     args = parser.parse_args()
+    device = args.device
+    allow_noise = not args.disable_noise
 
     n_mean_latent = 10000
 
@@ -111,7 +115,7 @@ if __name__ == '__main__':
         imgs.append(img)
 
     imgs = torch.stack(imgs, 0).to(device)
-
+    
     g_ema = Generator(args.size, 512, 8)
     g_ema.load_state_dict(torch.load(args.ckpt)['g_ema'], strict=False)
     g_ema.eval()
@@ -127,21 +131,28 @@ if __name__ == '__main__':
     percept = lpips.PerceptualLoss(
         model='net-lin', net='vgg', use_gpu=device.startswith('cuda')
     )
-
-    noises = g_ema.make_noise()
-
-    latent_in = latent_mean.detach().clone().unsqueeze(0).repeat(2, 1)
-
+    
+    if args.init_noise_zeros:
+        noises = g_ema.make_noise(zero=True)
+    else:
+        noises = g_ema.make_noise()
+    
+    latent_in = latent_mean.detach().clone().unsqueeze(0).repeat(1, 1)
+    
     if args.w_plus:
         latent_in = latent_in.unsqueeze(1).repeat(1, g_ema.n_latent, 1)
 
     latent_in.requires_grad = True
 
     for noise in noises:
-        noise.requires_grad = True
-
-    optimizer = optim.Adam([latent_in] + noises, lr=args.lr)
-
+        if allow_noise:
+            noise.requires_grad = True
+    
+    if allow_noise:
+        optimizer = optim.Adam([latent_in] + noises, lr=args.lr)
+    else:
+        optimizer = optim.Adam([latent_in], lr=args.lr)
+    
     pbar = tqdm(range(args.step))
     latent_path = []
 
@@ -165,38 +176,68 @@ if __name__ == '__main__':
             img_gen = img_gen.mean([3, 5])
 
         p_loss = percept(img_gen, imgs).sum()
-        n_loss = noise_regularize(noises)
         mse_loss = F.mse_loss(img_gen, imgs)
-
-        loss = p_loss + args.noise_regularize * n_loss + args.mse * mse_loss
+        loss = p_loss + args.mse * mse_loss
+        if allow_noise:
+            n_loss = noise_regularize(noises)
+            loss += args.noise_regularize * n_loss
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-
-        noise_normalize_(noises)
-
+        
         if (i + 1) % 100 == 0:
             latent_path.append(latent_in.detach().clone())
-
-        pbar.set_description(
-            (
-                f'perceptual: {p_loss.item():.4f}; noise regularize: {n_loss.item():.4f};'
-                f' mse: {mse_loss.item():.4f}; lr: {lr:.4f}'
+        
+        if allow_noise:
+            noise_normalize_(noises)
+            pbar.set_description(
+                (
+                    f'perceptual: {p_loss.item():.4f}; noise regularize: {n_loss.item():.4f};'
+                    f' mse: {mse_loss.item():.4f}; lr: {lr:.4f}'
+                )
             )
-        )
+        else:
+            pbar.set_description(
+                (
+                    f'perceptual: {p_loss.item():.4f};'
+                    f' mse: {mse_loss.item():.4f}; lr: {lr:.4f}'
+                )
+            )
 
     result_file = {'noises': noises}
 
     img_gen, _ = g_ema([latent_path[-1]], input_is_latent=True, noise=noises)
 
-    filename = os.path.splitext(os.path.basename(args.files[0]))[0] + '.pt'
-
+    suffix_name = ''
+    if args.w_plus:
+        suffix_name += '-wplus'
+    else:
+        suffix_name += '-worig'
+        
+    if allow_noise:
+        suffix_name += '-wnoise'
+    else:
+        suffix_name += '-wonoise'
+    
+    if args.init_noise_zeros:
+        suffix_name += '-zeros'
+    else:
+        suffix_name += '-rand'
+    
+    
+    filename = os.path.join(
+        args.path,
+        os.path.splitext(os.path.basename(args.files[0]))[0] + suffix_name + '.pt'
+    )
     img_ar = make_image(img_gen)
 
     for i, input_name in enumerate(args.files):
         result_file[input_name] = {'img': img_gen[i], 'latent': latent_in[i]}
-        img_name = os.path.splitext(os.path.basename(input_name))[0] + '-project.png'
+        img_name = os.path.join(
+            args.path,
+            os.path.splitext(os.path.basename(input_name))[0] + suffix_name + '.png'
+        )
         pil_img = Image.fromarray(img_ar[i])
         pil_img.save(img_name)
 
